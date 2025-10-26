@@ -5,6 +5,8 @@ import threading
 import os
 import json
 import base64
+import subprocess
+from datetime import datetime
 
 class OpenAIGUI:
     def __init__(self, root):
@@ -14,6 +16,9 @@ class OpenAIGUI:
 
         self.api_key = tk.StringVar()
         self.client = None
+        self.request_history = []
+        self.pending_logs = []
+        self.log_text = None
 
         self.build_ui()
 
@@ -30,7 +35,10 @@ class OpenAIGUI:
                 if callback:
                     self.root.after(0, lambda: callback(result))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                def handle_error():
+                    messagebox.showerror("Error", str(e))
+                    self.append_log(f"Error: {e}")
+                self.root.after(0, handle_error)
 
         threading.Thread(target=runner, daemon=True).start()
 
@@ -39,6 +47,17 @@ class OpenAIGUI:
             return json.dumps(payload, indent=2, ensure_ascii=False)
         except Exception:
             return str(payload)
+
+    def append_log(self, message):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{timestamp}] {message}\n"
+        if self.log_text:
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.insert(tk.END, entry)
+            self.log_text.see(tk.END)
+            self.log_text.configure(state=tk.DISABLED)
+        else:
+            self.pending_logs.append(entry)
 
     # ============================== UI ==============================
     def build_ui(self):
@@ -63,6 +82,8 @@ class OpenAIGUI:
         self.tab_finetune = self.make_finetune_tab()
         self.tab_responses = self.make_responses_tab()
         self.tab_videogen = self.make_videogen_tab()
+        self.tab_raw_curl = self.make_raw_curl_tab()
+        self.tab_logging = self.make_logging_tab()
 
         self.tabs.add(self.tab_assistants, text="Assistants")
         self.tabs.add(self.tab_files, text="Files")
@@ -75,6 +96,129 @@ class OpenAIGUI:
         self.tabs.add(self.tab_finetune, text="Finetuning & Workflows")
         self.tabs.add(self.tab_responses, text="Responses API")
         self.tabs.add(self.tab_videogen, text="VideoGen")
+        self.tabs.add(self.tab_raw_curl, text="Raw CURL")
+        self.tabs.add(self.tab_logging, text="Logging & Errors")
+
+    # ============================== RAW CURL ==============================
+    def make_raw_curl_tab(self):
+        frame = tk.Frame(self.tabs)
+
+        command_frame = tk.Frame(frame)
+        command_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        tk.Label(command_frame, text="CURL Command:").pack(anchor=tk.W)
+        self.curl_command_text = tk.Text(command_frame, height=12, wrap=tk.WORD)
+        self.curl_command_text.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
+
+        btn_frame = tk.Frame(command_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        tk.Button(btn_frame, text="Send Request", command=self.run_curl_command).pack(side=tk.LEFT)
+        tk.Button(btn_frame, text="Clear", command=lambda: self.curl_command_text.delete("1.0", tk.END)).pack(side=tk.LEFT, padx=5)
+
+        display_frame = tk.Frame(frame)
+        display_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        response_frame = tk.Frame(display_frame)
+        response_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tk.Label(response_frame, text="Response:").pack(anchor=tk.W)
+        self.curl_response_text = tk.Text(response_frame, height=15, wrap=tk.WORD, state=tk.DISABLED)
+        self.curl_response_text.pack(fill=tk.BOTH, expand=True)
+
+        history_frame = tk.Frame(display_frame, width=220)
+        history_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        tk.Label(history_frame, text="History:").pack(anchor=tk.W)
+        self.curl_history_list = tk.Listbox(history_frame, height=15)
+        self.curl_history_list.pack(fill=tk.BOTH, expand=True)
+        self.curl_history_list.bind("<<ListboxSelect>>", self.load_selected_history)
+
+        return frame
+
+    def run_curl_command(self):
+        command = self.curl_command_text.get("1.0", tk.END).strip()
+        if not command:
+            return messagebox.showerror("Error", "Enter a CURL command to execute.")
+        key = self.api_key.get().strip()
+        if not key:
+            return messagebox.showerror("Error", "Please enter your API key first.")
+
+        self.append_log(f"Sending CURL command:\n{command}")
+
+        def task():
+            env = os.environ.copy()
+            env["OPENAI_API_KEY"] = key
+            completed = subprocess.run(command, shell=True, capture_output=True, text=True, env=env)
+            return {
+                "command": command,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+                "returncode": completed.returncode,
+            }
+
+        def done(result):
+            self.request_history.append(result)
+            summary = result["command"].splitlines()[0]
+            if len(summary) > 80:
+                summary = summary[:77] + "..."
+            display_text = self.format_curl_output(result)
+            self.update_curl_response(display_text)
+            index_label = f"{len(self.request_history)}. {summary}"
+            self.curl_history_list.insert(tk.END, index_label)
+            self.curl_history_list.selection_clear(0, tk.END)
+            self.curl_history_list.selection_set(tk.END)
+            self.curl_history_list.see(tk.END)
+
+            log_message = (
+                f"CURL command completed with return code {result['returncode']}.\n"
+                f"STDOUT:\n{result['stdout']}\nSTDERR:\n{result['stderr']}"
+            )
+            self.append_log(log_message)
+
+        self.run_in_thread(task, done)
+
+    def format_curl_output(self, result):
+        parts = [f"Return code: {result['returncode']}"]
+        stdout = result.get("stdout", "")
+        stderr = result.get("stderr", "")
+        if stdout:
+            parts.append(f"STDOUT:\n{stdout}")
+        if stderr:
+            parts.append(f"STDERR:\n{stderr}")
+        return "\n\n".join(parts)
+
+    def update_curl_response(self, text):
+        self.curl_response_text.configure(state=tk.NORMAL)
+        self.curl_response_text.delete("1.0", tk.END)
+        self.curl_response_text.insert(tk.END, text or "No output returned.")
+        self.curl_response_text.configure(state=tk.DISABLED)
+
+    def load_selected_history(self, event):
+        selection = event.widget.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        if idx >= len(self.request_history):
+            return
+        entry = self.request_history[idx]
+        self.curl_command_text.delete("1.0", tk.END)
+        self.curl_command_text.insert(tk.END, entry["command"])
+        self.update_curl_response(self.format_curl_output(entry))
+
+    # ============================== LOGGING ==============================
+    def make_logging_tab(self):
+        frame = tk.Frame(self.tabs)
+        self.log_text = tk.Text(frame, state=tk.DISABLED, wrap=tk.WORD)
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        if self.pending_logs:
+            self.log_text.configure(state=tk.NORMAL)
+            for entry in self.pending_logs:
+                self.log_text.insert(tk.END, entry)
+            self.log_text.configure(state=tk.DISABLED)
+            self.log_text.see(tk.END)
+            self.pending_logs.clear()
+
+        return frame
+
 
     def connect(self):
         key = self.api_key.get().strip()
